@@ -1,0 +1,26 @@
+{
+  "name": "claude-code-zellij",
+  "version": "0.1.0",
+  "description": "Zellij terminal multiplexer support for Claude Code agent teams",
+  "main": "dist/src/index.js",
+  "bin": {
+    "claude-code-zellij": "dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "install-patch": "node dist/src/index.js install",
+    "uninstall-patch": "node dist/src/index.js uninstall",
+    "check": "node dist/src/index.js check"
+  },
+  "keywords": [
+    "claude-code",
+    "zellij",
+    "terminal-multiplexer",
+    "agent-teams"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
