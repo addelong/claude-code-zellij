@@ -7,55 +7,10 @@ import * as path from "path";
  * The patcher works by finding known anchor strings in the minified code
  * and injecting the ZellijBackend class and detection logic at the right points.
  *
- * Anchor strings are specific to Claude Code v2.1.34. If they change in
- * future versions, the patcher will report which anchors failed to match.
+ * String-literal anchors (log messages, error messages) are version-stable.
+ * Minified variable names are extracted dynamically via regex so the patcher
+ * survives minor version bumps where only the mangled names change.
  */
-
-// The Zellij detection functions (minified to match cli.js style)
-const ZELLIJ_DETECTION_CODE = [
-  'function isInsideZellijSync(){return process.env.ZELLIJ==="0"&&!!process.env.ZELLIJ_SESSION_NAME}',
-  "async function isInsideZellij(){return isInsideZellijSync()}",
-  'async function isZellijAvailable(){try{return(await CA("which",["zellij"])).code===0}catch{return!1}}',
-].join("\n");
-
-// The ZellijBackend class (minified to match cli.js style)
-const ZELLIJ_BACKEND_CLASS = [
-  "var zellijLockQueue=Promise.resolve();",
-  "var zellijBackendRegistered=null;",
-  "function registerZellijBackend(A){zellijBackendRegistered=A}",
-  'function createZellijBackend(){if(!zellijBackendRegistered)throw Error("ZellijBackend not registered.");return new zellijBackendRegistered}',
-  [
-    'class ZellijBackendImpl{type="zellij";displayName="Zellij";supportsHideShow=!1;paneCount=0;_pendingRelease=null;',
-    "async isAvailable(){return isInsideZellijSync()||await isZellijAvailable()}",
-    "async isRunningInside(){return isInsideZellij()}",
-    "async createTeammatePaneInSwarmView(A,q){",
-    "let K,Y=new Promise((z)=>{K=z}),w=zellijLockQueue;zellijLockQueue=Y;await w;",
-    "try{let z=this.paneCount===0;this.paneCount++;",
-    'let H="zellij-"+A+"-"+this.paneCount;',
-    'let $=await CA("zellij",["action","new-pane","--name",A]);',
-    'if($.code!==0){K();throw Error("Failed to create Zellij pane for "+A+": "+$.stderr)}',
-    "this._pendingRelease=K;",
-    'h("[ZellijBackend] Created pane for "+A+": "+H+", isFirst="+z);',
-    "await new Promise(O=>setTimeout(O,200));",
-    "return{paneId:H,isFirstTeammate:z}",
-    "}catch(z){if(this._pendingRelease){this._pendingRelease();this._pendingRelease=null}else{K()}throw z}}",
-    "async sendCommandToPane(A,q,K){",
-    'try{let Y=await CA("zellij",["action","write-chars",q]);',
-    'if(Y.code!==0)throw Error("Failed to write to Zellij pane "+A+": "+Y.stderr);',
-    'let z=await CA("zellij",["action","write","13"]);',
-    'if(z.code!==0)throw Error("Failed to send Enter to Zellij pane "+A+": "+z.stderr);',
-    'h("[ZellijBackend] Sent command to pane "+A)',
-    "}finally{if(this._pendingRelease){this._pendingRelease();this._pendingRelease=null}}}",
-    "async setPaneBorderColor(A,q,K){}",
-    "async setPaneTitle(A,q,K,Y){}",
-    "async enablePaneBorderStatus(A,q){}",
-    'async rebalancePanes(A,q){h("[ZellijBackend] rebalancePanes: no-op")}',
-    'async killPane(A,q){h("[ZellijBackend] killPane "+A+": best-effort");return!0}',
-    "async hidePane(A,q){return!1}",
-    "async showPane(A,q,K){return!1}}",
-  ].join(""),
-  "registerZellijBackend(ZellijBackendImpl);",
-].join("\n");
 
 export interface PatchResult {
   success: boolean;
@@ -63,6 +18,68 @@ export interface PatchResult {
   appliedPatches: string[];
   failedPatches: string[];
   warnings: string[];
+}
+
+/**
+ * Extract minified variable names from the cli.js source.
+ * Returns null if the expected patterns aren't found.
+ */
+function extractMinifiedNames(code: string): {
+  tmuxBackendClass: string;
+  tmuxFactory: string;
+  iterm2Factory: string;
+  cachedBackendRef: string;
+  cachedResultVar: string;
+  execFn: string;
+  logFn: string;
+  isInsideTmuxSyncFn: string;
+} | null {
+  // Find TmuxBackend class name: class XXX{type="tmux"
+  const tmuxClassMatch = code.match(/class\s+([A-Za-z0-9_$]+)\{type="tmux"/);
+  if (!tmuxClassMatch) return null;
+
+  // Find the cascade function by its log message. Extract variable names from:
+  // return VAR1=Y,VAR2={backend:Y,isNative:!0,...},VAR2
+  // Look for the pattern near "[BackendRegistry] Selected: tmux (running inside tmux session)"
+  const cascadeMatch = code.match(
+    /\[BackendRegistry\] Selected: tmux \(running inside tmux session\)"\);let (\w+)=(\w+)\(\);return (\w+)=\1,(\w+)=\{backend:\1,isNative:!0,needsIt2Setup:!1\},\4/
+  );
+  if (!cascadeMatch) return null;
+  const tmuxFactory = cascadeMatch[2];
+  const cachedBackendRef = cascadeMatch[3];
+  const cachedResultVar = cascadeMatch[4];
+
+  // Find exec function: used as XXX("which",...) or XXX("tmux",...) in isTmuxAvailable
+  // Pattern: (await XXX(TMUX_VAR,["-V"])).code===0  (isTmuxAvailable)
+  const execMatch = code.match(/\(await\s+(\w+)\(\w+,\["-V"\]\)\)\.code===0/);
+  if (!execMatch) return null;
+  const execFn = execMatch[1];
+
+  // Find iTerm2 factory from getBackendByType: case"iterm2":return XXX()
+  const iterm2Match = code.match(/case"iterm2":return\s+(\w+)\(\)/);
+  if (!iterm2Match) return null;
+
+  // Find the log/debug function. It's used as: h("[BackendRegistry]...")
+  // The function name 'h' has been stable, but let's extract it dynamically.
+  // Pattern: LOGFN("[BackendRegistry] Starting backend detection...")
+  const logMatch = code.match(/(\w+)\("\[BackendRegistry\] Starting backend detection\.\.\."\)/);
+  if (!logMatch) return null;
+
+  // Find isInsideTmuxSync: used in isInProcessEnabled as !XXX()
+  // Pattern: insideTmux=${XXX()})
+  const tmuxSyncMatch = code.match(/insideTmux=\$\{(\w+)\(\)\}/);
+  if (!tmuxSyncMatch) return null;
+
+  return {
+    tmuxBackendClass: tmuxClassMatch[1],
+    tmuxFactory,
+    iterm2Factory: iterm2Match[1],
+    cachedBackendRef,
+    cachedResultVar,
+    execFn,
+    logFn: logMatch[1],
+    isInsideTmuxSyncFn: tmuxSyncMatch[1],
+  };
 }
 
 /**
@@ -76,7 +93,7 @@ export function patchCliSource(source: string): PatchResult {
   const warnings: string[] = [];
 
   // Verify this looks like Claude Code cli.js
-  if (!code.includes("BackendRegistry") || !code.includes("TmuxBackend")) {
+  if (!code.includes("BackendRegistry") || !code.includes('type="tmux"')) {
     return {
       success: false,
       patchedSource: null,
@@ -100,10 +117,80 @@ export function patchCliSource(source: string): PatchResult {
     };
   }
 
+  // Extract minified variable names dynamically
+  const names = extractMinifiedNames(code);
+  if (!names) {
+    return {
+      success: false,
+      patchedSource: null,
+      appliedPatches: [],
+      failedPatches: [
+        "Could not extract minified variable names. The cli.js structure may have changed significantly.",
+      ],
+      warnings: [],
+    };
+  }
+
+  const {
+    tmuxBackendClass,
+    tmuxFactory,
+    iterm2Factory,
+    cachedBackendRef,
+    cachedResultVar,
+    execFn,
+    logFn,
+    isInsideTmuxSyncFn,
+  } = names;
+
+  // Build the injected Zellij code using the extracted names
+  const ZELLIJ_DETECTION_CODE = [
+    'function isInsideZellijSync(){return process.env.ZELLIJ==="0"&&!!process.env.ZELLIJ_SESSION_NAME}',
+    "async function isInsideZellij(){return isInsideZellijSync()}",
+    `async function isZellijAvailable(){try{return(await ${execFn}("which",["zellij"])).code===0}catch{return!1}}`,
+  ].join("\n");
+
+  const ZELLIJ_BACKEND_CLASS = [
+    "var zellijLockQueue=Promise.resolve();",
+    "var zellijBackendRegistered=null;",
+    "function registerZellijBackend(A){zellijBackendRegistered=A}",
+    'function createZellijBackend(){if(!zellijBackendRegistered)throw Error("ZellijBackend not registered.");return new zellijBackendRegistered}',
+    [
+      'class ZellijBackendImpl{type="zellij";displayName="Zellij";supportsHideShow=!1;paneCount=0;_pendingRelease=null;',
+      "async isAvailable(){return isInsideZellijSync()||await isZellijAvailable()}",
+      "async isRunningInside(){return isInsideZellij()}",
+      "async createTeammatePaneInSwarmView(A,q){",
+      "let K,Y=new Promise((z)=>{K=z}),w=zellijLockQueue;zellijLockQueue=Y;await w;",
+      "try{let z=this.paneCount===0;this.paneCount++;",
+      'let H="zellij-"+A+"-"+this.paneCount;',
+      `let $=await ${execFn}("zellij",["action","new-pane","--name",A]);`,
+      'if($.code!==0){K();throw Error("Failed to create Zellij pane for "+A+": "+$.stderr)}',
+      "this._pendingRelease=K;",
+      `${logFn}("[ZellijBackend] Created pane for "+A+": "+H+", isFirst="+z);`,
+      "await new Promise(O=>setTimeout(O,200));",
+      "return{paneId:H,isFirstTeammate:z}",
+      "}catch(z){if(this._pendingRelease){this._pendingRelease();this._pendingRelease=null}else{K()}throw z}}",
+      "async sendCommandToPane(A,q,K){",
+      `try{let Y=await ${execFn}("zellij",["action","write-chars",q]);`,
+      'if(Y.code!==0)throw Error("Failed to write to Zellij pane "+A+": "+Y.stderr);',
+      `let z=await ${execFn}("zellij",["action","write","13"]);`,
+      'if(z.code!==0)throw Error("Failed to send Enter to Zellij pane "+A+": "+z.stderr);',
+      `${logFn}("[ZellijBackend] Sent command to pane "+A)`,
+      "}finally{if(this._pendingRelease){this._pendingRelease();this._pendingRelease=null}}}",
+      "async setPaneBorderColor(A,q,K){}",
+      "async setPaneTitle(A,q,K,Y){}",
+      "async enablePaneBorderStatus(A,q){}",
+      `async rebalancePanes(A,q){${logFn}("[ZellijBackend] rebalancePanes: no-op")}`,
+      `async killPane(A,q){${logFn}("[ZellijBackend] killPane "+A+": best-effort");return!0}`,
+      "async hidePane(A,q){return!1}",
+      "async showPane(A,q,K){return!1}}",
+    ].join(""),
+    "registerZellijBackend(ZellijBackendImpl);",
+  ].join("\n");
+
   // ============================================================
   // PATCH 1: Inject ZellijBackend class before TmuxBackend
   // ============================================================
-  const tmuxBackendAnchor = 'class LTA{type="tmux"';
+  const tmuxBackendAnchor = `class ${tmuxBackendClass}{type="tmux"`;
   if (code.includes(tmuxBackendAnchor)) {
     const insertPos = code.indexOf(tmuxBackendAnchor);
     code =
@@ -115,27 +202,43 @@ export function patchCliSource(source: string): PatchResult {
       code.slice(insertPos);
     applied.push("Injected ZellijBackend class and detection functions");
   } else {
-    failed.push(
-      "PATCH 1: Could not find TmuxBackend class anchor"
-    );
+    failed.push("PATCH 1: Could not find TmuxBackend class anchor");
   }
 
   // ============================================================
   // PATCH 2: Insert Zellij detection in the backend cascade
+  // Anchor: the log message about tmux availability after iTerm2 check
   // ============================================================
-  const cascadeAnchor =
-    "let K=await Ts();if(h(`[BackendRegistry] Not in tmux or iTerm2, tmux available: ${K}`)";
+  const cascadeAnchor = `[BackendRegistry] Not in tmux or iTerm2, tmux available: \${K}\`)`;
   if (code.includes(cascadeAnchor)) {
-    const zellijCheck = [
-      'if(isInsideZellijSync()){',
-      'h("[BackendRegistry] Selected: zellij (running inside Zellij session)");',
-      "let ZB=createZellijBackend();",
-      "return qW1=ZB,ER={backend:ZB,isNative:!0,needsIt2Setup:!1},ER}",
-    ].join("");
-    code = code.replace(cascadeAnchor, zellijCheck + cascadeAnchor);
-    applied.push("Inserted Zellij detection in backend cascade");
+    // Find the full statement starting from "let K=await" before the anchor
+    const anchorPos = code.indexOf(cascadeAnchor);
+    // Search backwards for "let K=" to find the start of the statement
+    const searchStart = Math.max(0, anchorPos - 200);
+    const prefix = code.slice(searchStart, anchorPos);
+    const letKMatch = prefix.match(/let K=await\s+\w+\(\);if\(\w+\(`$/);
+    if (letKMatch) {
+      const fullAnchorStart = searchStart + prefix.lastIndexOf(letKMatch[0]);
+      const zellijCheck = [
+        "if(isInsideZellijSync()){",
+        `${logFn}("[BackendRegistry] Selected: zellij (running inside Zellij session)");`,
+        "let ZB=createZellijBackend();",
+        `return ${cachedBackendRef}=ZB,${cachedResultVar}={backend:ZB,isNative:!0,needsIt2Setup:!1},${cachedResultVar}}`,
+      ].join("");
+      code =
+        code.slice(0, fullAnchorStart) +
+        zellijCheck +
+        code.slice(fullAnchorStart);
+      applied.push("Inserted Zellij detection in backend cascade");
+    } else {
+      failed.push(
+        "PATCH 2: Found cascade log message but could not locate statement start"
+      );
+    }
   } else {
-    failed.push("PATCH 2: Could not find cascade anchor for Zellij detection");
+    failed.push(
+      "PATCH 2: Could not find cascade anchor for Zellij detection"
+    );
   }
 
   // ============================================================
@@ -146,10 +249,10 @@ export function patchCliSource(source: string): PatchResult {
   if (code.includes(errorAnchor)) {
     const zellijFallback = [
       "{let ZA=await isZellijAvailable();",
-      'if(h("[BackendRegistry] Checking zellij availability: "+ZA),ZA){',
-      'h("[BackendRegistry] Selected: zellij (external)");',
+      `if(${logFn}("[BackendRegistry] Checking zellij availability: "+ZA),ZA){`,
+      `${logFn}("[BackendRegistry] Selected: zellij (external)");`,
       "let ZB=createZellijBackend();",
-      "return qW1=ZB,ER={backend:ZB,isNative:!1,needsIt2Setup:!1},ER}}",
+      `return ${cachedBackendRef}=ZB,${cachedResultVar}={backend:ZB,isNative:!1,needsIt2Setup:!1},${cachedResultVar}}}`,
     ].join("");
     code = code.replace(errorAnchor, zellijFallback + errorAnchor);
     applied.push("Added Zellij as external fallback before error");
@@ -160,8 +263,7 @@ export function patchCliSource(source: string): PatchResult {
   // ============================================================
   // PATCH 4: Add "zellij" case to getBackendByType
   // ============================================================
-  const backendByTypeAnchor =
-    'case"tmux":return EM6();case"iterm2":return CI4()';
+  const backendByTypeAnchor = `case"tmux":return ${tmuxFactory}();case"iterm2":return ${iterm2Factory}()`;
   if (code.includes(backendByTypeAnchor)) {
     code = code.replace(
       backendByTypeAnchor,
@@ -190,7 +292,6 @@ export function patchCliSource(source: string): PatchResult {
 
   for (const { find, replace } of errorMsgReplacements) {
     if (code.includes(find)) {
-      // Replace all occurrences
       while (code.includes(find)) {
         code = code.replace(find, replace);
       }
@@ -200,6 +301,32 @@ export function patchCliSource(source: string): PatchResult {
         `Error message not found (may already be patched): "${find.slice(0, 40)}..."`
       );
     }
+  }
+
+  // ============================================================
+  // PATCH 6: Make isInProcessEnabled() recognize Zellij
+  //
+  // The original logic defaults to in-process when NOT in tmux:
+  //   else q=!TMUX_SYNC_FN();
+  // We change it to also check Zellij:
+  //   else q=!TMUX_SYNC_FN()&&!isInsideZellijSync();
+  //
+  // Without this patch, agents always run in-process inside Zellij
+  // because the code only checks for tmux when deciding pane vs in-process.
+  // ============================================================
+  const inProcessAnchor = `else q=!${isInsideTmuxSyncFn}()`;
+  if (code.includes(inProcessAnchor)) {
+    code = code.replace(
+      inProcessAnchor,
+      `else q=!${isInsideTmuxSyncFn}()&&!isInsideZellijSync()`
+    );
+    applied.push(
+      "Patched isInProcessEnabled to recognize Zellij sessions"
+    );
+  } else {
+    failed.push(
+      "PATCH 6: Could not find isInProcessEnabled anchor for Zellij check"
+    );
   }
 
   return {

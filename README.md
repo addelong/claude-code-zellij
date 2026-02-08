@@ -30,13 +30,15 @@ If you installed Claude Code via the curl script or Homebrew cask, you'll need t
 
 ### Version compatibility
 
-The patch anchors are specific to Claude Code **v2.1.34**'s minified variable names. Other versions will likely have different minified names and the patch will fail. Use the `check` command to verify compatibility before installing:
+The patcher dynamically extracts minified variable names from `cli.js` using regex, so it survives minor version bumps where only the mangled names change. Tested with v2.1.34 and v2.1.36.
+
+If a future version changes the code structure (not just variable names), the patch may fail. Use the `check` command to verify compatibility before installing:
 
 ```bash
 node dist/src/index.js check
 ```
 
-If a future Claude Code version changes the minified names, the check output will show exactly which anchor strings failed to match, making it straightforward to update the patcher.
+The check output will show exactly which patches can or cannot be applied.
 
 ## Install
 
@@ -143,7 +145,7 @@ The focus-based write approach means there is a brief window (~200ms) between pa
 ## Compatibility
 
 Tested with:
-- Claude Code v2.1.34 (npm install)
+- Claude Code v2.1.34, v2.1.36 (npm install)
 - Zellij 0.43.0
 - Linux (Ubuntu 24.04)
 
